@@ -8,7 +8,7 @@ import asyncio
 from urllib.parse import urlencode
 from collections import deque
 from dataclasses import dataclass
-
+from typing import Optional, Dict, Any
 import requests
 import websockets
 
@@ -79,7 +79,7 @@ def okx_headers(method: str, request_path: str, body: str = "") -> dict:
         **SIM_HEADER,
     }
 
-def rest_get(path: str, params: dict | None = None) -> dict:
+def rest_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     qs = ""
     if params:
         qs = "?" + urlencode(params)
