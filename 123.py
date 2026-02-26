@@ -47,9 +47,9 @@ WS_PUBLIC = os.getenv(
     "wss://wspap.okx.com:8443/ws/v5/public?brokerId=9999"
 )
 
-API_KEY = os.getenv("OKX_API_KEY", "")
-API_SECRET = os.getenv("OKX_API_SECRET", "")
-API_PASSPHRASE = os.getenv("OKX_API_PASSPHRASE", "")
+API_KEY = os.getenv("OKX_API_KEY", "edd59d8d-7214-4246-9c6c-6dee1b7c9d1d")
+API_SECRET = os.getenv("OKX_API_SECRET", "29737A3E27AD6B9C0C145CC6BC5A4509")
+API_PASSPHRASE = os.getenv("OKX_API_PASSPHRASE", "Sxw1998021299..")
 
 # Demo 必须带这个头
 SIM_HEADER = {"x-simulated-trading": "1"}
