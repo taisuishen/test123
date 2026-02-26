@@ -22,7 +22,7 @@ NET_MODE = True            # 单向持仓（net） -> 下单不传 posSide
 
 # ====== 仓位：1x 全仓 ======
 LEVERAGE = 1.0             # 1倍名义
-MAX_CONTRACTS = 100.0       # 最大下单张数上限（强烈建议先小一点，确认稳定后再调大）
+MAX_CONTRACTS = 10.0       # 最大下单张数上限（强烈建议先小一点，确认稳定后再调大）
 
 # ====== 触发参数 ======
 VOL_LOOKBACK_SEC = 1800    # 30分钟
@@ -34,7 +34,7 @@ MIN_WARMUP_SEC = 300       # 启动后至少累计300秒成交量历史再交易
 # ====== 出场规则 ======
 SL_ATR_K = 0.60
 TP_ATR_K = 1.00
-TIME_STOP_SEC = 180
+TIME_STOP_SEC = None
 
 # =======================
 # OKX Demo endpoints / Keys
@@ -44,12 +44,13 @@ REST_BASE = os.getenv("OKX_REST_BASE", "https://www.okx.com")
 # Demo 公共 WS（建议带 brokerId=9999）
 WS_PUBLIC = os.getenv(
     "OKX_WS_PUBLIC",
-    "wss://wspap.okx.com:8443/ws/v5/public"
+    "wss://wspap.okx.com:8443/ws/v5/public?brokerId=9999"
 )
 
-API_KEY = os.getenv("OKX_API_KEY", "edd59d8d-7214-4246-9c6c-6dee1b7c9d1d")
-API_SECRET = os.getenv("OKX_API_SECRET", "29737A3E27AD6B9C0C145CC6BC5A4509")
-API_PASSPHRASE = os.getenv("OKX_API_PASSPHRASE", "Sxw1998021299..")
+API_KEY = os.getenv("OKX_API_KEY", "")
+API_SECRET = os.getenv("OKX_API_SECRET", "")
+API_PASSPHRASE = os.getenv("OKX_API_PASSPHRASE", "")
+
 # Demo 必须带这个头
 SIM_HEADER = {"x-simulated-trading": "1"}
 
@@ -365,12 +366,14 @@ class SweepBot:
 
         hit_tp = (px >= p.tp_px) if p.side == "long" else (px <= p.tp_px)
         hit_sl = (px <= p.sl_px) if p.side == "long" else (px >= p.sl_px)
-        hit_time = (time.time() - p.open_ts) >= TIME_STOP_SEC
+		hit_time = False
+		if TIME_STOP_SEC is not None:
+			hit_time = (time.time() - p.open_ts) >= TIME_STOP_SEC
 
-        if not (hit_tp or hit_sl or hit_time):
-            return
+		if not (hit_tp or hit_sl or hit_time):
+			return
 
-        reason = "TP" if hit_tp else "SL" if hit_sl else "TIME"
+		reason = "TP" if hit_tp else "SL" if hit_sl else "TIME"
         print(
             f"[EXIT:{reason}] {p.side} px={px:.2f} entry={p.entry_px:.2f} "
             f"tp={p.tp_px:.2f} sl={p.sl_px:.2f} sz={p.sz}"
