@@ -366,14 +366,14 @@ class SweepBot:
 
         hit_tp = (px >= p.tp_px) if p.side == "long" else (px <= p.tp_px)
         hit_sl = (px <= p.sl_px) if p.side == "long" else (px >= p.sl_px)
-		hit_time = False
-		if TIME_STOP_SEC is not None:
-			hit_time = (time.time() - p.open_ts) >= TIME_STOP_SEC
+        hit_time = False
+        if TIME_STOP_SEC is not None:
+            hit_time = (time.time() - p.open_ts) >= TIME_STOP_SEC
 
-		if not (hit_tp or hit_sl or hit_time):
-			return
+        if not (hit_tp or hit_sl or hit_time):
+            return
 
-		reason = "TP" if hit_tp else "SL" if hit_sl else "TIME"
+        reason = "TP" if hit_tp else "SL" if hit_sl else "TIME"
         print(
             f"[EXIT:{reason}] {p.side} px={px:.2f} entry={p.entry_px:.2f} "
             f"tp={p.tp_px:.2f} sl={p.sl_px:.2f} sz={p.sz}"
