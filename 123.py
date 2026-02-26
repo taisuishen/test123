@@ -8,6 +8,8 @@ import asyncio
 from urllib.parse import urlencode
 from collections import deque
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_DOWN
+from typing import Optional, Dict, Any
 
 import requests
 import websockets
@@ -18,47 +20,42 @@ import websockets
 INST_ID = "ETH-USDT-SWAP"
 TD_MODE = "cross"          # 全仓
 ORD_TYPE = "market"        # 市价单（taker）
-NET_MODE = True            # 单向持仓（net） -> 下单不传 posSide
-
-# ====== 仓位：1x 全仓 ======
-LEVERAGE = 1.0             # 1倍名义
-MAX_CONTRACTS = 10.0       # 最大下单张数上限（强烈建议先小一点，确认稳定后再调大）
+LEVERAGE = 1.0             # 1x 名义
+MAX_CONTRACTS = 10.0       # 最大张数上限（先小后大）
 
 # ====== 触发参数 ======
 VOL_LOOKBACK_SEC = 1800    # 30分钟
-VOL_Q = 0.95               # 成交量分位阈值（p95）
-MOVE_ATR_K = 0.35          # 净推进 >= 0.35 * ATR_1m
-COOLDOWN_SEC = 60          # 同方向/同策略冷却
-MIN_WARMUP_SEC = 300       # 启动后至少累计300秒成交量历史再交易
+VOL_Q = 0.95               # 成交量阈值分位（p95）
+MOVE_ATR_K = 0.35          # 触发要求：净推进 >= MOVE_ATR_K * ATR
+COOLDOWN_SEC = 60
+MIN_WARMUP_SEC = 300
 
-# ====== 出场规则 ======
+# ====== ATR 周期（放大这里）======
+ATR_BAR = "15m"            # ✅ 推荐：15m；想更中周期：改成 "1H"
+ATR_PERIOD = 14
+ATR_LIMIT = 200
+
+# ====== 出场规则（TP/SL 只依赖 ATR_BAR 的 ATR）======
 SL_ATR_K = 0.60
 TP_ATR_K = 1.00
-TIME_STOP_SEC = None
 
 # =======================
 # OKX Demo endpoints / Keys
 # =======================
 REST_BASE = os.getenv("OKX_REST_BASE", "https://www.okx.com")
-
-# Demo 公共 WS（建议带 brokerId=9999）
-WS_PUBLIC = os.getenv(
-    "OKX_WS_PUBLIC",
-    "wss://wspap.okx.com:8443/ws/v5/public?brokerId=9999"
-)
+WS_PUBLIC = os.getenv("OKX_WS_PUBLIC", "wss://wspap.okx.com:8443/ws/v5/public?brokerId=9999")
 
 API_KEY = os.getenv("OKX_API_KEY", "edd59d8d-7214-4246-9c6c-6dee1b7c9d1d")
 API_SECRET = os.getenv("OKX_API_SECRET", "29737A3E27AD6B9C0C145CC6BC5A4509")
 API_PASSPHRASE = os.getenv("OKX_API_PASSPHRASE", "Sxw1998021299..")
 
-# Demo 必须带这个头
-SIM_HEADER = {"x-simulated-trading": "1"}
+SIM_HEADER = {"x-simulated-trading": "1"}  # Demo 必须
 
 if not API_KEY or not API_SECRET or not API_PASSPHRASE:
     raise RuntimeError("Please set env OKX_API_KEY / OKX_API_SECRET / OKX_API_PASSPHRASE")
 
 # =======================
-# OKX 签名工具（你验证过的版本）
+# OKX 签名（GET query 入签名）
 # =======================
 def iso_ts() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S.", time.gmtime()) + f"{int((time.time()%1)*1000):03d}Z"
@@ -68,7 +65,7 @@ def sign_okx(ts: str, method: str, request_path: str, body: str) -> str:
     mac = hmac.new(API_SECRET.encode("utf-8"), prehash.encode("utf-8"), digestmod="sha256").digest()
     return base64.b64encode(mac).decode()
 
-def okx_headers(method: str, request_path: str, body: str = "") -> dict:
+def okx_headers(method: str, request_path: str, body: str = "") -> Dict[str, str]:
     ts = iso_ts()
     sig = sign_okx(ts, method, request_path, body)
     return {
@@ -80,7 +77,7 @@ def okx_headers(method: str, request_path: str, body: str = "") -> dict:
         **SIM_HEADER,
     }
 
-def rest_get(path: str, params: dict | None = None) -> dict:
+def rest_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     qs = ""
     if params:
         qs = "?" + urlencode(params)
@@ -94,7 +91,7 @@ def rest_get(path: str, params: dict | None = None) -> dict:
         r.raise_for_status()
     return r.json()
 
-def rest_post(path: str, payload: dict) -> dict:
+def rest_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     request_path = path
     body = json.dumps(payload, separators=(",", ":"))
     url = REST_BASE + request_path
@@ -107,7 +104,7 @@ def rest_post(path: str, payload: dict) -> dict:
     return r.json()
 
 # =======================
-# 交易所信息 / 计算
+# 合约规格 / 精度工具（解决 51121）
 # =======================
 @dataclass
 class ContractSpec:
@@ -116,6 +113,23 @@ class ContractSpec:
     minSz: float
     ctValCcy: str
     settleCcy: str
+
+def step_decimals(step: float) -> int:
+    s = format(step, "f")
+    if "." in s:
+        return len(s.rstrip("0").split(".")[1])
+    return 0
+
+def floor_to_step(x: float, step: float) -> float:
+    dx = Decimal(str(x))
+    ds = Decimal(str(step))
+    n = (dx / ds).to_integral_value(rounding=ROUND_DOWN)
+    return float(n * ds)
+
+def fmt_by_step(x: float, step: float) -> str:
+    d = step_decimals(step)
+    q = Decimal("1") if d == 0 else Decimal("0." + "0"*(d-1) + "1")
+    return str(Decimal(str(x)).quantize(q, rounding=ROUND_DOWN))
 
 def get_contract_spec() -> ContractSpec:
     j = rest_get("/api/v5/public/instruments", {"instType": "SWAP", "instId": INST_ID})
@@ -130,16 +144,11 @@ def get_contract_spec() -> ContractSpec:
         settleCcy=x.get("settleCcy", ""),
     )
 
-def round_down_to_step(x: float, step: float) -> float:
-    return math.floor(x / step) * step
-
 def get_equity_usdt() -> float:
     j = rest_get("/api/v5/account/balance", {"ccy": "USDT"})
     if j.get("code") != "0" or not j.get("data"):
         raise RuntimeError(f"get balance failed: {j}")
     data0 = j["data"][0]
-
-    # 尽量保守：优先 totalEq，不行再 details->eq
     if data0.get("totalEq"):
         return float(data0["totalEq"])
     for d in data0.get("details", []):
@@ -147,8 +156,8 @@ def get_equity_usdt() -> float:
             return float(d["eq"])
     raise RuntimeError(f"cannot parse equity: {j}")
 
-def get_atr_1m(period: int = 14, limit: int = 200) -> float:
-    j = rest_get("/api/v5/market/candles", {"instId": INST_ID, "bar": "1m", "limit": str(limit)})
+def get_atr(bar: str, period: int = 14, limit: int = 200) -> float:
+    j = rest_get("/api/v5/market/candles", {"instId": INST_ID, "bar": bar, "limit": str(limit)})
     if j.get("code") != "0" or not j.get("data"):
         raise RuntimeError(f"get candles failed: {j}")
 
@@ -174,54 +183,54 @@ def get_atr_1m(period: int = 14, limit: int = 200) -> float:
         atr = (atr * (period - 1) + tr) / period
     return atr
 
-def calc_contracts_1x_cross(spec: ContractSpec, equity_usdt: float, price: float) -> float:
-    """
-    1x 全仓：名义价值 = equity_usdt * LEVERAGE
-    ETH数量 = 名义 / 价格
-    合约张数 = ETH数量 / ctVal
-    """
+def calc_contracts_1x(spec: ContractSpec, equity_usdt: float, price: float) -> float:
     if price <= 0:
         return 0.0
-    notional_usdt = equity_usdt * LEVERAGE
-    eth_qty = notional_usdt / price
+    notional = equity_usdt * LEVERAGE
+    eth_qty = notional / price
     contracts = eth_qty / spec.ctVal
 
-    qty = round_down_to_step(contracts, spec.lotSz)
+    qty = floor_to_step(contracts, spec.lotSz)
     if qty < spec.minSz:
         return 0.0
 
-    # 上限保护
-    qty = min(qty, MAX_CONTRACTS)
-    qty = round_down_to_step(qty, spec.lotSz)
+    cap = floor_to_step(MAX_CONTRACTS, spec.lotSz)
+    qty = min(qty, cap)
+    qty = floor_to_step(qty, spec.lotSz)
     if qty < spec.minSz:
         return 0.0
     return qty
 
 # =======================
-# 下单 / 平仓（市价）
+# 下单：随单附带 TP/SL（触发后市价执行）
 # =======================
-def place_market(side: str, sz: float) -> dict:
+def place_market_with_tpsl(spec: ContractSpec, side: str, sz: float, tp_px: float, sl_px: float) -> Dict[str, Any]:
+    sz_str = fmt_by_step(sz, spec.lotSz)
+
     payload = {
         "instId": INST_ID,
         "tdMode": TD_MODE,
-        "side": side,        # buy / sell
-        "ordType": ORD_TYPE, # market
-        "sz": str(sz),
+        "side": side,         # buy / sell
+        "ordType": ORD_TYPE,  # market
+        "sz": sz_str,
+
+        "attachAlgoOrds": [{
+            "tpTriggerPx": str(tp_px),
+            "tpOrdPx": "-1",            # -1 触发后市价
+            "slTriggerPx": str(sl_px),
+            "slOrdPx": "-1",            # -1 触发后市价
+            "tpTriggerPxType": "last",
+            "slTriggerPxType": "last",
+        }]
     }
-    # 单向持仓 net：不传 posSide
     return rest_post("/api/v5/trade/order", payload)
 
-def close_market(pos_side: str, sz: float) -> dict:
-    # 单向持仓：平仓方向与开仓相反
-    side = "sell" if pos_side == "long" else "buy"
-    return place_market(side, sz)
-
 # =======================
-# 运行时状态
+# 运行状态
 # =======================
 @dataclass
-class Position:
-    side: str       # "long" / "short"
+class PositionLocal:
+    side: str
     entry_px: float
     sz: float
     tp_px: float
@@ -231,19 +240,17 @@ class Position:
 class SweepBot:
     def __init__(self, spec: ContractSpec):
         self.spec = spec
-        self.position: Position | None = None
-        self.last_trade_px: float | None = None
+        self.position: Optional[PositionLocal] = None
+        self.last_trade_px: Optional[float] = None
 
         self.cooldown_until = 0.0
-
-        self.vol_hist = deque(maxlen=VOL_LOOKBACK_SEC)  # 每秒成交量
+        self.vol_hist = deque(maxlen=VOL_LOOKBACK_SEC)
         self.start_ts = time.time()
 
         self.cur_sec = None
         self.sec_vol = 0.0
         self.sec_first_px = None
         self.sec_last_px = None
-        self.sec_count = 0
 
     def ready(self) -> bool:
         return (time.time() - self.start_ts) >= MIN_WARMUP_SEC and len(self.vol_hist) >= MIN_WARMUP_SEC
@@ -256,7 +263,7 @@ class SweepBot:
         idx = max(0, min(idx, len(arr) - 1))
         return arr[idx]
 
-    async def on_trade(self, t: dict):
+    async def on_trade(self, t: Dict[str, Any]):
         px = float(t["px"])
         sz = float(t["sz"])
         ts_ms = int(t["ts"])
@@ -270,18 +277,13 @@ class SweepBot:
 
         if sec != self.cur_sec:
             await self.on_second_bar()
-            # reset to new second
             self.cur_sec = sec
             self.sec_vol = 0.0
             self.sec_first_px = px
             self.sec_last_px = px
-            self.sec_count = 0
 
         self.sec_vol += sz
         self.sec_last_px = px
-        self.sec_count += 1
-
-        await self.check_exit()
 
     async def on_second_bar(self):
         if self.sec_first_px is None or self.sec_last_px is None:
@@ -291,7 +293,6 @@ class SweepBot:
         dP = self.sec_last_px - self.sec_first_px
         self.vol_hist.append(V)
 
-        # 只在无仓位时开新仓
         if self.position is not None:
             return
         if time.time() < self.cooldown_until:
@@ -301,9 +302,9 @@ class SweepBot:
         if V < v_th:
             return
 
-        # 成交量满足后再计算 ATR（避免频繁 REST）
+        # ✅ ATR 用更大周期
         try:
-            atr = get_atr_1m(14, 200)
+            atr = get_atr(ATR_BAR, ATR_PERIOD, ATR_LIMIT)
         except Exception as e:
             print("[ATR ERROR]", e)
             self.cooldown_until = time.time() + COOLDOWN_SEC
@@ -312,7 +313,6 @@ class SweepBot:
         if abs(dP) < MOVE_ATR_K * atr:
             return
 
-        # 计算 1x 全仓张数（用触发秒最后价估算）
         try:
             equity = get_equity_usdt()
         except Exception as e:
@@ -321,7 +321,7 @@ class SweepBot:
             return
 
         ref_px = self.last_trade_px if self.last_trade_px else self.sec_last_px
-        qty = calc_contracts_1x_cross(self.spec, equity, ref_px)
+        qty = calc_contracts_1x(self.spec, equity, ref_px)
         if qty <= 0:
             print("[SKIP] qty too small or capped to 0")
             self.cooldown_until = time.time() + COOLDOWN_SEC
@@ -331,22 +331,22 @@ class SweepBot:
         pos_side = "long" if side == "buy" else "short"
 
         entry_px = ref_px
-        stop_dist = SL_ATR_K * atr
+        sl_dist = SL_ATR_K * atr
         tp_dist = TP_ATR_K * atr
 
-        sl_px = entry_px - stop_dist if pos_side == "long" else entry_px + stop_dist
+        sl_px = entry_px - sl_dist if pos_side == "long" else entry_px + sl_dist
         tp_px = entry_px + tp_dist if pos_side == "long" else entry_px - tp_dist
 
         print(
-            f"[ENTRY SIGNAL] {pos_side} qty={qty} V={V:.4f} v_th={v_th:.4f} "
-            f"dP={dP:.3f} atr={atr:.3f} equity={equity:.2f} ref_px={ref_px:.2f}"
+            f"[ENTRY SIGNAL] {pos_side} qty={qty} V={V:.4f} v_th={v_th:.4f} dP={dP:.3f} "
+            f"ATR({ATR_BAR})={atr:.3f} equity={equity:.2f} entry_ref={entry_px:.2f} TP={tp_px:.2f} SL={sl_px:.2f}"
         )
 
-        resp = place_market(side, qty)
+        resp = place_market_with_tpsl(self.spec, side, qty, tp_px, sl_px)
         print("[ORDER RESP]", resp)
 
         if resp.get("code") == "0":
-            self.position = Position(
+            self.position = PositionLocal(
                 side=pos_side,
                 entry_px=entry_px,
                 sz=qty,
@@ -357,34 +357,6 @@ class SweepBot:
 
         self.cooldown_until = time.time() + COOLDOWN_SEC
 
-    async def check_exit(self):
-        if self.position is None or self.last_trade_px is None:
-            return
-
-        p = self.position
-        px = self.last_trade_px
-
-        hit_tp = (px >= p.tp_px) if p.side == "long" else (px <= p.tp_px)
-        hit_sl = (px <= p.sl_px) if p.side == "long" else (px >= p.sl_px)
-        hit_time = False
-        if TIME_STOP_SEC is not None:
-            hit_time = (time.time() - p.open_ts) >= TIME_STOP_SEC
-
-        if not (hit_tp or hit_sl or hit_time):
-            return
-
-        reason = "TP" if hit_tp else "SL" if hit_sl else "TIME"
-        print(
-            f"[EXIT:{reason}] {p.side} px={px:.2f} entry={p.entry_px:.2f} "
-            f"tp={p.tp_px:.2f} sl={p.sl_px:.2f} sz={p.sz}"
-        )
-
-        resp = close_market(p.side, p.sz)
-        print("[CLOSE RESP]", resp)
-
-        self.position = None
-        self.cooldown_until = time.time() + COOLDOWN_SEC
-
 # =======================
 # WS 循环
 # =======================
@@ -392,29 +364,15 @@ async def ws_loop(bot: SweepBot):
     while True:
         try:
             async with websockets.connect(WS_PUBLIC, ping_interval=20, ping_timeout=20) as ws:
-                sub = {
-                    "op": "subscribe",
-                    "args": [
-                        {"channel": "trades", "instId": INST_ID},
-                        {"channel": "books5", "instId": INST_ID},
-                    ],
-                }
+                sub = {"op": "subscribe", "args": [{"channel": "trades", "instId": INST_ID}]}
                 await ws.send(json.dumps(sub))
                 print("[WS] subscribed", sub)
-
-                # 先读订阅回包
-                for _ in range(2):
-                    try:
-                        msg = await asyncio.wait_for(ws.recv(), timeout=5)
-                        print("[WS RAW]", msg)
-                    except asyncio.TimeoutError:
-                        break
 
                 while True:
                     msg = await asyncio.wait_for(ws.recv(), timeout=30)
                     j = json.loads(msg)
-
                     ch = j.get("arg", {}).get("channel")
+
                     if "event" in j:
                         print("[WS EVENT]", j)
 
@@ -422,7 +380,6 @@ async def ws_loop(bot: SweepBot):
                         for t in j.get("data", []):
                             await bot.on_trade(t)
 
-                    # books5 暂时不做过滤；你后续要加 spread 过滤可以在这里处理
         except asyncio.TimeoutError:
             print("[WS] 30s no message -> reconnect")
         except Exception as e:
@@ -431,7 +388,7 @@ async def ws_loop(bot: SweepBot):
 
 async def main():
     spec = get_contract_spec()
-    print("[SPEC]", spec)
+    print("[SPEC]", spec, "ATR_BAR=", ATR_BAR)
     bot = SweepBot(spec)
     await ws_loop(bot)
 
